@@ -28,7 +28,7 @@ class AlturiVoteBot:
         self.driver = None
         self.accounts_file = 'accounts.json'
         self.vote_times_file = 'vote_times.json'
-        self.webhook_url = 'DISCORD_WEBHOOK_URL_HERE'  # Setze hier deine Discord Webhook URL ein
+        self.webhook_url = 'https://discord.com/api/webhooks/1410015421356310589/D8BMzL10uKYESq47j69S3ujXznO6KEsd7gFXc4E_gxwK-B6JLlQ-bus6FgC2neOSA1Tj'
         
         # Timezone Setup für Deutschland
         self.germany_tz = pytz.timezone('Europe/Berlin')
@@ -77,7 +77,17 @@ class AlturiVoteBot:
         }
         chrome_options.add_experimental_option('prefs', prefs)
         
-        self.driver = webdriver.Chrome(options=chrome_options)
+        # ChromeDriver Setup (funktioniert mit Chrome und Chromium)
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+        except Exception as e:
+            # Fallback für Chromium
+            logging.warning(f"Chrome-Setup fehlgeschlagen, versuche Chromium: {e}")
+            chrome_options.binary_location = '/usr/bin/chromium'
+            from selenium.webdriver.chrome.service import Service
+            service = Service('/usr/bin/chromedriver')
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        
         self.driver.implicitly_wait(10)
         
         # Anti-Detection Script
@@ -123,6 +133,42 @@ class AlturiVoteBot:
         return {}
     
     def save_vote_times(self, vote_times):
+        """Speichere Vote-Zeiten"""
+        with open(self.vote_times_file, 'w') as f:
+            json.dump(vote_times, f, indent=4)
+    
+    def sync_vote_times_with_accounts(self, accounts, vote_times):
+        """Synchronisiere vote_times.json mit accounts.json"""
+        try:
+            # Sammle alle aktuellen Usernames aus accounts.json
+            current_usernames = {account['username'] for account in accounts}
+            
+            # Sammle alle Usernames aus vote_times.json
+            stored_usernames = set(vote_times.keys())
+            
+            # Finde neue Accounts (in accounts.json aber nicht in vote_times.json)
+            new_accounts = current_usernames - stored_usernames
+            
+            # Finde entfernte Accounts (in vote_times.json aber nicht in accounts.json)
+            removed_accounts = stored_usernames - current_usernames
+            
+            # Entferne alte Accounts aus vote_times
+            for username in removed_accounts:
+                del vote_times[username]
+                logging.info(f"🗑️  Account '{username}' aus vote_times.json entfernt (nicht mehr in accounts.json)")
+            
+            # Logge neue Accounts (werden beim ersten Vote automatisch hinzugefügt)
+            if new_accounts:
+                logging.info(f"🆕 Neue Accounts erkannt: {', '.join(new_accounts)} - werden beim ersten Vote hinzugefügt")
+            
+            if removed_accounts:
+                logging.info(f"Synchronisation: {len(removed_accounts)} Account(s) entfernt, {len(new_accounts)} neue Account(s) erkannt")
+            
+            return vote_times
+            
+        except Exception as e:
+            logging.error(f"Fehler bei der Synchronisation von vote_times: {e}")
+            return vote_times
         """Speichere Vote-Zeiten"""
         with open(self.vote_times_file, 'w') as f:
             json.dump(vote_times, f, indent=4)
@@ -554,16 +600,20 @@ class AlturiVoteBot:
             logging.error(f"Fehler beim Logout: {e}")
             return False
     
-    def process_account(self, account, vote_times):
-        """Verarbeite einen Account"""
+    def should_process_account(self, account, vote_times):
+        """Prüfe ob Account verarbeitet werden soll basierend auf vote_times"""
         username = account['username']
-        password = account['password']
         name = account.get('name', username)
         
-        logging.info(f"Verarbeite Account: {name}")
+        # Neuer Account - immer verarbeiten
+        if username not in vote_times:
+            logging.info(f"🆕 Neuer Account '{name}' - wird sofort verarbeitet")
+            return True, "Neuer Account"
         
-        if username in vote_times:
+        # Bestehender Account - prüfe Zeit
+        try:
             last_next_vote = datetime.fromisoformat(vote_times[username])
+            
             # Stelle sicher dass gespeicherte Zeit auch timezone-aware ist
             if last_next_vote.tzinfo is None:
                 last_next_vote = self.germany_tz.localize(last_next_vote)
@@ -571,67 +621,144 @@ class AlturiVoteBot:
             vote_possible_time = last_next_vote + timedelta(minutes=1)
             current_time = self.get_current_time()
             
-            if current_time < vote_possible_time:
+            if current_time >= vote_possible_time:
+                logging.info(f"⏰ Account '{name}' ist bereit zum Voten (möglich seit: {vote_possible_time})")
+                return True, f"Vote möglich seit {vote_possible_time}"
+            else:
                 wait_time = vote_possible_time - current_time
-                logging.info(f"{name}: Noch nicht Zeit zu voten. Warten noch {wait_time}")
-                return vote_times
+                logging.info(f"⌛ Account '{name}' noch nicht bereit. Warten noch {wait_time}")
+                return False, f"Warten noch {wait_time}"
+                
+        except Exception as e:
+            logging.error(f"Fehler beim Prüfen der Vote-Zeit für '{name}': {e}")
+            logging.info(f"🔄 Verarbeite Account '{name}' aufgrund von Zeit-Parsing Fehler")
+            return True, f"Zeitfehler - wird verarbeitet: {e}"
+        """Verarbeite einen Account"""
+    def process_account(self, account, vote_times):
+        """Verarbeite einen Account"""
+        username = account['username']
+        password = account['password']
+        name = account.get('name', username)
         
+        logging.info(f"🔄 Verarbeite Account: {name}")
+        
+        # Prüfe ob Account verarbeitet werden soll
+        should_process, reason = self.should_process_account(account, vote_times)
+        
+        if not should_process:
+            logging.info(f"⏭️  Account '{name}' übersprungen: {reason}")
+            return vote_times
+        
+        logging.info(f"▶️  Account '{name}' wird verarbeitet: {reason}")
+        
+        # Setup neuer Browser
         self.setup_driver()
         
         try:
+            # Login
             if self.login(username, password):
-                # Vote prüfen und ausführen (mit account-name für webhooks)
+                # Vote prüfen und ausführen
                 result = self.check_and_vote(username, account)
                 
                 if isinstance(result, datetime):
                     # Speichere nächste Vote-Zeit
                     vote_times[username] = result.isoformat()
-                    logging.info(f"{name}: Nächste Vote-Zeit gespeichert: {result}")
+                    logging.info(f"💾 {name}: Nächste Vote-Zeit gespeichert: {result}")
                 elif result is True:
-                    logging.info(f"{name}: Vote erfolgreich durchgeführt!")
+                    logging.info(f"✅ {name}: Vote erfolgreich durchgeführt!")
+                else:
+                    logging.warning(f"⚠️  {name}: Vote-Prozess ohne Ergebnis")
                 
                 # Logout
                 self.logout()
+            else:
+                logging.error(f"❌ {name}: Login fehlgeschlagen - Account übersprungen")
             
+        except Exception as e:
+            logging.error(f"💥 Fehler beim Verarbeiten von Account '{name}': {e}")
         finally:
             self.close_driver()
         
         return vote_times
     
     def run(self):
-        """Hauptschleife"""
-        accounts = self.load_accounts()
-        
-        if not accounts:
-            logging.error("Keine Accounts gefunden!")
-            return
-        
-        logging.info(f"Starte Vote-Bot mit {len(accounts)} Accounts")
+        """Hauptschleife - lädt accounts.json bei jedem Durchlauf neu"""
+        logging.info("🚀 Starte Alturi Vote Bot...")
         
         while True:
             try:
-                vote_times = self.load_vote_times()
+                # === SCHRITT 1: Accounts neu laden ===
+                logging.info("📁 Lade accounts.json neu...")
+                accounts = self.load_accounts()
                 
-                for account in accounts:
+                if not accounts:
+                    logging.error("❌ Keine Accounts in accounts.json gefunden!")
+                    time.sleep(300)  # Warte 5 Minuten
+                    continue
+                
+                logging.info(f"📋 {len(accounts)} Account(s) geladen: {[acc.get('name', acc['username']) for acc in accounts]}")
+                
+                # === SCHRITT 2: Vote-Zeiten laden und synchronisieren ===
+                logging.info("⚙️  Lade und synchronisiere vote_times.json...")
+                vote_times = self.load_vote_times()
+                vote_times = self.sync_vote_times_with_accounts(accounts, vote_times)
+                
+                # === SCHRITT 3: Accounts verarbeiten ===
+                logging.info(f"🔄 Starte Verarbeitung von {len(accounts)} Account(s)...")
+                
+                accounts_processed = 0
+                accounts_voted = 0
+                accounts_skipped = 0
+                
+                for i, account in enumerate(accounts, 1):
+                    account_name = account.get('name', account['username'])
+                    logging.info(f"\n--- Account {i}/{len(accounts)}: {account_name} ---")
+                    
                     try:
+                        old_vote_times = vote_times.copy()
                         vote_times = self.process_account(account, vote_times)
+                        
+                        # Prüfe ob Account verarbeitet wurde
+                        if vote_times != old_vote_times or account['username'] not in old_vote_times:
+                            accounts_processed += 1
+                            if account['username'] in vote_times:
+                                # Neue Zeit gespeichert = Vote war möglich
+                                accounts_voted += 1
+                        else:
+                            accounts_skipped += 1
+                        
+                        # Speichere vote_times nach jedem Account
                         self.save_vote_times(vote_times)
                         
-                        # Kurze Pause zwischen Accounts
-                        time.sleep(5)
+                        # Pause zwischen Accounts (außer beim letzten)
+                        if i < len(accounts):
+                            logging.info("⏸️  Pause 5 Sekunden zwischen Accounts...")
+                            time.sleep(5)
                         
                     except Exception as e:
-                        logging.error(f"Fehler beim Verarbeiten von Account {account.get('name', account['username'])}: {e}")
+                        logging.error(f"💥 Kritischer Fehler bei Account '{account_name}': {e}")
+                        accounts_skipped += 1
                 
-                # Warte 1min vor nächstem Durchlauf
-                logging.info("Warte 1 Minute bis zum nächsten Durchlauf...")
-                time.sleep(60)
+                # === SCHRITT 4: Durchlauf-Zusammenfassung ===
+                logging.info(f"\n🏁 Durchlauf abgeschlossen:")
+                logging.info(f"   📊 Accounts gesamt: {len(accounts)}")
+                logging.info(f"   ✅ Verarbeitet: {accounts_processed}")
+                logging.info(f"   🗳️  Gevotet: {accounts_voted}")
+                logging.info(f"   ⏭️  Übersprungen: {accounts_skipped}")
+                
+                # === SCHRITT 5: Wartezeit bis nächster Durchlauf ===
+                wait_minutes = 1
+                logging.info(f"⏰ Warte {wait_minutes} Minuten bis zum nächsten Durchlauf...")
+                logging.info(f"🕐 Nächster Check um: {(self.get_current_time() + timedelta(minutes=wait_minutes)).strftime('%H:%M:%S')}")
+                
+                time.sleep(wait_minutes * 60)
                 
             except KeyboardInterrupt:
-                logging.info("Bot gestoppt durch Benutzer")
+                logging.info("🛑 Bot gestoppt durch Benutzer (Strg+C)")
                 break
             except Exception as e:
-                logging.error(f"Unerwarteter Fehler: {e}")
+                logging.error(f"💥 Unerwarteter Fehler in der Hauptschleife: {e}")
+                logging.info("🔄 Warte 60 Sekunden vor Neustart...")
                 time.sleep(60)
 
 if __name__ == "__main__":
