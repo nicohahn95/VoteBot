@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  votebot:
+    build: .
+    container_name: alturi-votebot
+    restart: always
+    volumes:
+      - ./data:/app  
+    environment:
+      - TZ=Europe/Berlin
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
